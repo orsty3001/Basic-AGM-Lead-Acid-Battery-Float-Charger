@@ -1,7 +1,7 @@
 Arduino Solar Car Battery Maintainer (25W PWM Charger)
 
-This project is an open-source Arduino-based smart solar maintainer designed to keep a 12 V automotive battery (Lead Acid or AGM) fully charged using a small solar panel (25 W recommended).
-It is ideal for vehicles stored long-term without access to AC power—such as an SUV parked under a future car-port or in remote locations.
+This project is an open-source Arduino-based smart solar maintainer designed to keep a 12V automotive battery (Lead Acid or AGM) fully charged using a small solar panel (25W recommended).
+It is ideal for vehicles stored long-term without access to AC power—such as an SUV parked under a future carport or in remote locations.
 
 The system performs full three-stage charging (Bulk → Absorb → Float) with temperature compensation and includes a built-in OLED status display, calibration tools, and support for both °C and °F temperature units.
 
@@ -9,7 +9,7 @@ Features
 
 Smart 3-Stage Charging: Bulk, Absorption, and Float—just like commercial maintainers.
 PWM-Based Charge Control: Simple, efficient, and reliable for 12 V nominal panels.
-Battery Type Selection: Choose FLA or AGM, each with proper voltage targets.
+Battery Type Selection: Choose between FLA and AGM, each with its respective voltage target.
 Temperature Compensation: Adjusts charge voltage based on battery temp (NTC sensor).
 OLED Display (SSD1306): Real-time readout of:
 Battery voltage
@@ -51,7 +51,7 @@ Why PWM Instead of MPPT?
 For maintaining a healthy car battery with a 25 W panel, PWM is:
 Simpler
 More reliable outdoors
-Nearly as efficient for this use-case
+Nearly as efficient for this use case
 Much easier to implement without a custom buck converter
 The design focuses on long-term reliability, low idle power, and easy DIY assembly.
 
@@ -75,7 +75,7 @@ Intended Use
 Long-term storage of cars, trucks, SUVs, boats, tractors, generators, etc.
 Situations where AC power isn’t available (driveways, fields, carports).
 Prevents sulfation and preserves battery life.
-This project was designed for a 1999 GMC Yukon Denali but works with any 12 V lead-acid system.
+This project was designed to maintain a car battery for a vehicle being parked under a carport in an area that doesn't have power ran to it. 
 
 Licensing
 
