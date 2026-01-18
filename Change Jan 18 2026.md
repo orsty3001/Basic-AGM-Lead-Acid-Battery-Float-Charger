@@ -1,10 +1,10 @@
-Changelog - Jan 18th 2026
+**Changelog - Jan 18th 2026**
 
 
 Latest Code Revision 1.1v (PWM Solar Float Charger, Nano + SSD1306)
 Board Rev.B 
 
-PCB
+**PCB:**
 
 The silkscreen is wrong for the resistor divider for the battery to PIN A0. 
 
@@ -13,7 +13,7 @@ The top resistor should be 150k ohms and the bottom should be 6.8k ohms if you l
 If you have a REV. A board. Just put a 150k resistor in the 6.8k spot, and the 6.8k in the 100k right above the 10 amp fuse. 
 
 
-Added
+**Added:**
 
 Dual calibration paths (Battery vs PV):
 
@@ -49,7 +49,7 @@ Temperature unit selection persisted in EEPROM:
 
 Added useFahrenheit setting and storage at EE_TEMP_UNIT.
 
-Changed
+**Changed:**
 
 PV divider ratio updated for higher PV open-circuit voltage:
 
@@ -71,7 +71,7 @@ Enums placed at top.
 
 Added explicit forward declarations for key functions (including button handlers).
 
-Fixed
+**Fixed:**
 
 Compile issues related to missing functions and mismatched symbol names:
 
@@ -83,10 +83,10 @@ EEPROM initialization logic updated to populate new calibration fields:
 
 On first run (magic mismatch), defaults are written for both BAT and PV calibration slots.
 
-Notes / Implications
+**Notes / Implications:**
 
-EEPROM compatibility:
+**EEPROM compatibility:**
 Because the EEPROM layout changed, boards previously flashed with older firmware may interpret old EEPROM bytes as the new PV calibration floats. If PV readings appear wildly incorrect, perform a “factory reset” by bumping EE_MAGIC_VAL (or add a reset routine) to reinitialize EEPROM defaults.
 
-PV measurement headroom:
+**PV measurement headroom:**
 With R1_PV=150k / R2_PV=6.8k and 1.1 V reference, PV input clips at approximately 25.36 V; higher PV voltage will saturate the ADC and the display will not increase beyond that (unless calibration values are corrupted).
