@@ -45,7 +45,7 @@ enum CalItem {
   CALI_ADC_OFFSET_DOWN,
   CALI_CAPTURE_BULK,
   CALI_CAPTURE_FLOAT,
-  CALI_TEMP_UNIT,   // NEW: °C / °F toggle
+  CALI_TEMP_UNIT,   // °C / °F toggle
   CALI_EXIT
 };
 
@@ -54,6 +54,8 @@ const __FlashStringHelper* calItemName(CalItem it);
 int  estimateSOC(float vBat, Stage s);
 void enterStage(Stage s);
 void regulateVoltage(float vBat, float vSet);
+void handleButtons_RUN();
+void handleButtons_CAL(float vBat);
 
 /*************** OLED ***************/
 #define SCREEN_WIDTH 128
@@ -74,7 +76,9 @@ const uint8_t BTN2_PIN  = 3;    // Adjust/Confirm (to GND, INPUT_PULLUP)
 // Voltage dividers (Ohms)
 const float R1_BAT = 100000.0f;
 const float R2_BAT =   6800.0f;
-const float R1_PV  = 100000.0f;
+
+// PV divider updated for ~25V full-scale @ 1.1V ref
+const float R1_PV  = 150000.0f;
 const float R2_PV  =   6800.0f;
 
 // NTC (10k, B≈3950). Divider: 5V -> 10k fixed -> A2 -> 10k NTC -> GND
@@ -114,25 +118,36 @@ const uint32_t CONTROL_PERIOD_MS = 500;
 
 /*************** EEPROM LAYOUT ***************/
 const uint8_t EE_MAGIC_ADDR = 0;
-const uint8_t EE_MAGIC_VAL  = 0x42;
+const uint8_t EE_MAGIC_VAL  = 0x43;
 const int     EE_MODE       = 1;
-const int     EE_CAL_SCALE  = 2;
-const int     EE_CAL_OFFSET = 6;
-const int     EE_FLA_START  = 10;
-const int     EE_AGM_START  = EE_FLA_START + sizeof(Profile);
-// Place temp unit flag right after the AGM profile block:
-const int     EE_TEMP_UNIT  = EE_AGM_START + sizeof(Profile); // 0 = °C, 1 = °F
 
-void ewrite(int addr, const void* p, size_t n){ for(size_t i=0;i<n;i++) EEPROM.update(addr+i, ((const uint8_t*)p)[i]); }
-void eread (int addr, void* p, size_t n){ for(size_t i=0;i<n;i++) ((uint8_t*)p)[i]=EEPROM.read(addr+i); }
+// Separate BAT and PV calibration
+const int EE_CAL_SCALE_BAT  = 2;   // float (4 bytes) 2..5
+const int EE_CAL_OFFSET_BAT = 6;   // float (4 bytes) 6..9
+const int EE_CAL_SCALE_PV   = 10;  // float (4 bytes) 10..13
+const int EE_CAL_OFFSET_PV  = 14;  // float (4 bytes) 14..17
+
+// Profiles start after calibration block
+const int EE_FLA_START  = 18;
+const int EE_AGM_START  = EE_FLA_START + (int)sizeof(Profile);
+const int EE_TEMP_UNIT  = EE_AGM_START + (int)sizeof(Profile); // 0 = °C, 1 = °F
+
+void ewrite(int addr, const void* p, size_t n){
+  for(size_t i=0;i<n;i++) EEPROM.update(addr+i, ((const uint8_t*)p)[i]);
+}
+void eread (int addr, void* p, size_t n){
+  for(size_t i=0;i<n;i++) ((uint8_t*)p)[i]=EEPROM.read(addr+i);
+}
 
 /*************** STATE ***************/
 Stage       stage = NIGHT;
 BatteryMode batteryMode = MODE_FLA;
 Profile     profileFLA, profileAGM;
 
-float cal_scale  = 1.000f;
-float cal_offset = 0.000f;
+float cal_scale_bat  = 1.000f;
+float cal_offset_bat = 0.000f;
+float cal_scale_pv   = 1.000f;
+float cal_offset_pv  = 0.000f;
 
 bool useFahrenheit = false; // persisted in EEPROM
 
@@ -149,23 +164,32 @@ bool btn1WasDown = false, btn2WasDown = false;
 
 uint16_t rawBat=0, rawPv=0;
 
+/*************** BUTTON HELPERS ***************/
+inline bool btn1Down(){ return digitalRead(BTN1_PIN)==LOW; }
+inline bool btn2Down(){ return digitalRead(BTN2_PIN)==LOW; }
+
 /*************** UTILS ***************/
 uint16_t readADCavg(uint8_t pin){
+  analogRead(pin); // throw-away first read after mux switch
   uint32_t sum=0;
   for(uint16_t i=0;i<ADC_SAMPLES;i++) sum += analogRead(pin);
   return (uint16_t)(sum / ADC_SAMPLES);
 }
 
-float dividerVoltage(uint16_t adc, float R1, float R2){
+float dividerVoltage(uint16_t adc, float R1, float R2, float scale, float offset){
   float v_in = (adc / 1023.0f) * ADC_REF_V;
   float v_actual = v_in * (R1 + R2) / R2;
-  return v_actual * cal_scale + cal_offset;
+  return v_actual * scale + offset;
 }
 
 float readNTCdegC(){
   uint16_t adc = readADCavg(NTC_PIN);
-  float Vnode = (adc / 1023.0f) * 1.1f;  // ADC ref = 1.1V
+  float Vnode = (adc / 1023.0f) * ADC_REF_V;  // 1.1V ref
   const float Vs = 5.0f;
+  // Guard against division by zero if wiring is open/short
+  if (Vnode < 0.001f) Vnode = 0.001f;
+  if (Vnode > (Vs - 0.001f)) Vnode = Vs - 0.001f;
+
   float Rntc = NTC_R_FIXED * (Vnode / (Vs - Vnode));
   float invT = (1.0f/NTC_T0_KELVIN) + (1.0f/NTC_BETA)*log(Rntc/NTC_R0);
   float Tk = 1.0f / invT;
@@ -180,7 +204,11 @@ void setChargeOutput(uint8_t duty){
 void chargeOn(){ setChargeOutput(CONTROL_MODE==PWM_MODE ? PWM_MAX : 255); }
 void chargeOff(){ setChargeOutput(0); }
 
-void enterStage(Stage s){ stage = s; if (s==ABSORB) absorbStart = millis(); integrator=0.0f; }
+void enterStage(Stage s){
+  stage = s;
+  if (s==ABSORB) absorbStart = millis();
+  integrator=0.0f;
+}
 
 Profile& currentProfile(){ return (batteryMode==MODE_FLA) ? profileFLA : profileAGM; }
 
@@ -192,7 +220,10 @@ float tempCompensate(float baseV, float tempC, float slopePerDegC){
 int estimateSOC(float vBat, Stage s){
   if (s!=NIGHT && vBat>13.0f) return 100;
   struct P{ float v; int soc; };
-  const P curve[] = {{11.9f,10},{12.0f,20},{12.2f,40},{12.3f,55},{12.4f,70},{12.5f,80},{12.6f,90},{12.7f,95},{12.8f,100}};
+  const P curve[] = {
+    {11.9f,10},{12.0f,20},{12.2f,40},{12.3f,55},{12.4f,70},
+    {12.5f,80},{12.6f,90},{12.7f,95},{12.8f,100}
+  };
   if (vBat <= curve[0].v) return curve[0].soc;
   for (int i=1;i<(int)(sizeof(curve)/sizeof(curve[0]));++i){
     if (vBat <= curve[i].v){
@@ -226,7 +257,7 @@ void drawRunScreen(float vBat, float vPv, float tempC, float vBulkT, float vFloa
   display.print(F("Vpv : ")); display.print(vPv, 2); display.print(F("V"));
 
   display.setCursor(0,32);
-  float dispTemp = useFahrenheit ? (tempC * 9.0/5.0 + 32.0) : tempC;
+  float dispTemp = useFahrenheit ? (tempC * 9.0f/5.0f + 32.0f) : tempC;
   display.print(F("Temp: ")); display.print(dispTemp,1);
   display.print(useFahrenheit ? F("F  ") : F("C  "));
   display.print(F("Out: "));
@@ -270,9 +301,9 @@ void drawCalMenu(float vBat){
   display.setCursor(0,12); display.print(calItemName(calItem));
 
   display.setCursor(0,28);
-  display.print(F("Scale: "));  display.print(cal_scale,4);
+  display.print(F("Scale: "));  display.print(cal_scale_bat,4);
   display.setCursor(0,38);
-  display.print(F("Offset: ")); display.print(cal_offset,3); display.print(F("V"));
+  display.print(F("Offset: ")); display.print(cal_offset_bat,3); display.print(F("V"));
 
   display.setCursor(0,50);
   display.print(F("Vbat: ")); display.print(vBat,2); display.print(F("V"));
@@ -283,28 +314,29 @@ void drawCalMenu(float vBat){
 }
 
 /*************** BUTTONS ***************/
-inline bool btn1Down(){ return digitalRead(BTN1_PIN)==LOW; }
-inline bool btn2Down(){ return digitalRead(BTN2_PIN)==LOW; }
-
 void handleButtons_RUN(){
   bool b1 = btn1Down();
   bool b2 = btn2Down();
   uint32_t now = millis();
 
   if (b1 && !btn1WasDown) btn1DownAt = now;
+
   if (!b1 && btn1WasDown){
     if ((now - btn1DownAt) < 1500){
+      // short press: toggle battery profile
       batteryMode = (batteryMode==MODE_FLA)?MODE_AGM:MODE_FLA;
       EEPROM.update(EE_MODE, (uint8_t)batteryMode);
     }
   }
+
   if (b1 && btn1WasDown && (now - btn1DownAt) >= 3000){
+    // long press: enter CAL
     ui = CAL_MENU;
     calItem = CALI_ADC_SCALE_UP;
     btn1DownAt = now + 100000; // prevent repeats
   }
 
-  (void)b2; // BTN2 unused on RUN
+  (void)b2; // BTN2 unused on RUN screen
   btn1WasDown = b1;
   btn2WasDown = b2;
 }
@@ -322,30 +354,65 @@ void handleButtons_CAL(float vBat){
     }
   }
 
-  // BTN2 short = small adjust / toggle; long = large/confirm
+  // BTN2 short = small adjust / toggle
   if (b2 && !btn2WasDown) btn2DownAt = now;
   if (!b2 && btn2WasDown){
     if ((now - btn2DownAt) < 1200){
       switch(calItem){
-        case CALI_ADC_SCALE_UP:    cal_scale += 0.002f; ewrite(EE_CAL_SCALE, &cal_scale, sizeof(cal_scale)); break;
-        case CALI_ADC_SCALE_DOWN:  cal_scale -= 0.002f; ewrite(EE_CAL_SCALE, &cal_scale, sizeof(cal_scale)); break;
-        case CALI_ADC_OFFSET_UP:   cal_offset += 0.010f; ewrite(EE_CAL_OFFSET,&cal_offset,sizeof(cal_offset)); break;
-        case CALI_ADC_OFFSET_DOWN: cal_offset -= 0.010f; ewrite(EE_CAL_OFFSET,&cal_offset,sizeof(cal_offset)); break;
-        case CALI_TEMP_UNIT: {
+        case CALI_ADC_SCALE_UP:
+          cal_scale_bat += 0.002f;
+          ewrite(EE_CAL_SCALE_BAT, &cal_scale_bat, sizeof(cal_scale_bat));
+          break;
+
+        case CALI_ADC_SCALE_DOWN:
+          cal_scale_bat -= 0.002f;
+          ewrite(EE_CAL_SCALE_BAT, &cal_scale_bat, sizeof(cal_scale_bat));
+          break;
+
+        case CALI_ADC_OFFSET_UP:
+          cal_offset_bat += 0.010f;
+          ewrite(EE_CAL_OFFSET_BAT, &cal_offset_bat, sizeof(cal_offset_bat));
+          break;
+
+        case CALI_ADC_OFFSET_DOWN:
+          cal_offset_bat -= 0.010f;
+          ewrite(EE_CAL_OFFSET_BAT, &cal_offset_bat, sizeof(cal_offset_bat));
+          break;
+
+        case CALI_TEMP_UNIT:
           useFahrenheit = !useFahrenheit;
           EEPROM.update(EE_TEMP_UNIT, (uint8_t)(useFahrenheit ? 1 : 0));
           break;
-        }
-        default: break; // captures and exit on long press
+
+        default:
+          break;
       }
     }
   }
+
+  // BTN2 long = large adjust / confirm
   if (b2 && btn2WasDown && (now - btn2DownAt) >= 1800){
     switch(calItem){
-      case CALI_ADC_SCALE_UP:    cal_scale += 0.010f; ewrite(EE_CAL_SCALE, &cal_scale, sizeof(cal_scale)); break;
-      case CALI_ADC_SCALE_DOWN:  cal_scale -= 0.010f; ewrite(EE_CAL_SCALE, &cal_scale, sizeof(cal_scale)); break;
-      case CALI_ADC_OFFSET_UP:   cal_offset += 0.050f; ewrite(EE_CAL_OFFSET,&cal_offset,sizeof(cal_offset)); break;
-      case CALI_ADC_OFFSET_DOWN: cal_offset -= 0.050f; ewrite(EE_CAL_OFFSET,&cal_offset,sizeof(cal_offset)); break;
+      case CALI_ADC_SCALE_UP:
+        cal_scale_bat += 0.010f;
+        ewrite(EE_CAL_SCALE_BAT, &cal_scale_bat, sizeof(cal_scale_bat));
+        break;
+
+      case CALI_ADC_SCALE_DOWN:
+        cal_scale_bat -= 0.010f;
+        ewrite(EE_CAL_SCALE_BAT, &cal_scale_bat, sizeof(cal_scale_bat));
+        break;
+
+      case CALI_ADC_OFFSET_UP:
+        cal_offset_bat += 0.050f;
+        ewrite(EE_CAL_OFFSET_BAT, &cal_offset_bat, sizeof(cal_offset_bat));
+        break;
+
+      case CALI_ADC_OFFSET_DOWN:
+        cal_offset_bat -= 0.050f;
+        ewrite(EE_CAL_OFFSET_BAT, &cal_offset_bat, sizeof(cal_offset_bat));
+        break;
+
       case CALI_CAPTURE_BULK: {
         Profile &p = currentProfile();
         p.bulk_target = vBat;
@@ -353,6 +420,7 @@ void handleButtons_CAL(float vBat){
         else                        ewrite(EE_AGM_START, &profileAGM, sizeof(Profile));
         break;
       }
+
       case CALI_CAPTURE_FLOAT: {
         Profile &p = currentProfile();
         p.float_target = vBat;
@@ -360,16 +428,17 @@ void handleButtons_CAL(float vBat){
         else                        ewrite(EE_AGM_START, &profileAGM, sizeof(Profile));
         break;
       }
-      case CALI_TEMP_UNIT: {
-        // Long-press also toggles, just in case user prefers holding
+
+      case CALI_TEMP_UNIT:
         useFahrenheit = !useFahrenheit;
         EEPROM.update(EE_TEMP_UNIT, (uint8_t)(useFahrenheit ? 1 : 0));
         break;
-      }
+
       case CALI_EXIT:
         ui = RUN_SCREEN;
         break;
     }
+
     btn2DownAt = now + 100000; // prevent repeats
   }
 
@@ -385,8 +454,10 @@ void regulateVoltage(float vBat, float vSet){
     else if (vBat > (vSet + HYST)) chargeOff();
     return;
   }
+
   float error = vSet - vBat;
   integrator += error * (CONTROL_PERIOD_MS / 1000.0f);
+
   if (integrator > 20.0f) integrator = 20.0f;
   if (integrator < -2.0f) integrator = -2.0f;
 
@@ -404,25 +475,35 @@ void regulateVoltage(float vBat, float vSet){
 void loadOrInitEEPROM(){
   if (EEPROM.read(EE_MAGIC_ADDR) != EE_MAGIC_VAL){
     EEPROM.update(EE_MAGIC_ADDR, EE_MAGIC_VAL);
+
     uint8_t mode = (uint8_t)MODE_FLA;
     EEPROM.update(EE_MODE, mode);
-    float sc=1.0f, off=0.0f;
-    ewrite(EE_CAL_SCALE, &sc, sizeof(sc));
-    ewrite(EE_CAL_OFFSET, &off, sizeof(off));
+
+    float scb=1.0f, offb=0.0f, scp=1.0f, offp=0.0f;
+    ewrite(EE_CAL_SCALE_BAT,  &scb, sizeof(scb));
+    ewrite(EE_CAL_OFFSET_BAT, &offb, sizeof(offb));
+    ewrite(EE_CAL_SCALE_PV,   &scp, sizeof(scp));
+    ewrite(EE_CAL_OFFSET_PV,  &offp, sizeof(offp));
+
     ewrite(EE_FLA_START, &DEFAULT_FLA, sizeof(Profile));
     ewrite(EE_AGM_START, &DEFAULT_AGM, sizeof(Profile));
+
     EEPROM.update(EE_TEMP_UNIT, (uint8_t)0); // default to °C
   }
+
   uint8_t mode = EEPROM.read(EE_MODE);
   batteryMode = (mode==1)?MODE_AGM:MODE_FLA;
 
-  eread(EE_CAL_SCALE, &cal_scale, sizeof(cal_scale));
-  eread(EE_CAL_OFFSET, &cal_offset, sizeof(cal_offset));
+  eread(EE_CAL_SCALE_BAT,  &cal_scale_bat,  sizeof(cal_scale_bat));
+  eread(EE_CAL_OFFSET_BAT, &cal_offset_bat, sizeof(cal_offset_bat));
+  eread(EE_CAL_SCALE_PV,   &cal_scale_pv,   sizeof(cal_scale_pv));
+  eread(EE_CAL_OFFSET_PV,  &cal_offset_pv,  sizeof(cal_offset_pv));
+
   eread(EE_FLA_START, &profileFLA, sizeof(Profile));
   eread(EE_AGM_START, &profileAGM, sizeof(Profile));
 
   uint8_t rawUnit = EEPROM.read(EE_TEMP_UNIT);
-  if (rawUnit > 1) { // sanitize if old/uninit value
+  if (rawUnit > 1) {
     useFahrenheit = false;
     EEPROM.update(EE_TEMP_UNIT, (uint8_t)0);
   } else {
@@ -442,14 +523,17 @@ void setup(){
 
   loadOrInitEEPROM();
 
-  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)){
-    // continue headless if OLED not detected
-  }
+  (void)display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
   display.clearDisplay(); display.display();
 
   Serial.begin(115200);
   Serial.println(F("Solar Maintainer (OLED, TempComp, Calibration, Dual Buttons, C/F Units)"));
   Serial.print(F("Mode: ")); Serial.println( (batteryMode==MODE_FLA)?"FLA":"AGM" );
+
+  Serial.print("cal_scale_bat="); Serial.println(cal_scale_bat, 6);
+  Serial.print("cal_offset_bat="); Serial.println(cal_offset_bat, 6);
+  Serial.print("cal_scale_pv=");  Serial.println(cal_scale_pv,  6);
+  Serial.print("cal_offset_pv="); Serial.println(cal_offset_pv, 6);
 }
 
 void loop(){
@@ -458,8 +542,9 @@ void loop(){
   // Read inputs
   rawBat = readADCavg(BAT_V_PIN);
   rawPv  = readADCavg(PV_V_PIN);
-  float vBat = dividerVoltage(rawBat, R1_BAT, R2_BAT);
-  float vPv  = dividerVoltage(rawPv,  R1_PV,  R2_PV);
+
+  float vBat = dividerVoltage(rawBat, R1_BAT, R2_BAT, cal_scale_bat, cal_offset_bat);
+  float vPv  = dividerVoltage(rawPv,  R1_PV,  R2_PV,  cal_scale_pv,  cal_offset_pv);
   float tempC = readNTCdegC();
 
   // Buttons
@@ -474,6 +559,7 @@ void loop(){
   // Control cadence
   if (now - lastControl >= CONTROL_PERIOD_MS){
     lastControl = now;
+
     bool pvPresent = (vPv > PV_PRESENT_MIN) && (vPv > vBat + PV_MARGIN_ON);
 
     if (!pvPresent){
@@ -484,14 +570,17 @@ void loop(){
           if (vBat < REBULK_ENTRY_V) enterStage(BULK);
           else enterStage(FLOAT);
           break;
+
         case BULK:
           chargeOn();
           if (vBat >= vBulkT - 0.05f) enterStage(ABSORB);
           break;
+
         case ABSORB:
           regulateVoltage(vBat, vBulkT);
           if ((millis()-absorbStart) >= (uint32_t)(p.absorb_time_s*1000UL)) enterStage(FLOAT);
           break;
+
         case FLOAT:
           if (vBat < REBULK_ENTRY_V) { enterStage(BULK); break; }
           regulateVoltage(vBat, vFloatT);
