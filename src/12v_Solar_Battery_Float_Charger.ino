@@ -177,20 +177,20 @@ uint16_t readADCavg(uint8_t pin){
 }
 
 float dividerVoltage(uint16_t adc, float R1, float R2, float scale, float offset){
-  float v_in = (adc / 1023.0f) * ADC_REF_V;
+  // Using 5.0V reference instead of 1.1V to prevent saturation at 17V+
+  float v_in = (adc / 1023.0f) * 5.0f; 
   float v_actual = v_in * (R1 + R2) / R2;
   return v_actual * scale + offset;
 }
 
 float readNTCdegC(){
   uint16_t adc = readADCavg(NTC_PIN);
-  float Vnode = (adc / 1023.0f) * ADC_REF_V;  // 1.1V ref
-  const float Vs = 5.0f;
-  // Guard against division by zero if wiring is open/short
-  if (Vnode < 0.001f) Vnode = 0.001f;
-  if (Vnode > (Vs - 0.001f)) Vnode = Vs - 0.001f;
+  
+  if (adc >= 1023) return -99.0f;
+  if (adc <= 0)    return 99.0f;
 
-  float Rntc = NTC_R_FIXED * (Vnode / (Vs - Vnode));
+  // Since everything is 5V now, we don't need to switch references anymore
+  float Rntc = NTC_R_FIXED * ((float)adc / (1023.0f - (float)adc));
   float invT = (1.0f/NTC_T0_KELVIN) + (1.0f/NTC_BETA)*log(Rntc/NTC_R0);
   float Tk = 1.0f / invT;
   return Tk - 273.15f;
@@ -319,8 +319,8 @@ void handleButtons_RUN(){
   bool b2 = btn2Down();
   uint32_t now = millis();
 
+  // --- Button 1 (D2) Logic ---
   if (b1 && !btn1WasDown) btn1DownAt = now;
-
   if (!b1 && btn1WasDown){
     if ((now - btn1DownAt) < 1500){
       // short press: toggle battery profile
@@ -328,15 +328,24 @@ void handleButtons_RUN(){
       EEPROM.update(EE_MODE, (uint8_t)batteryMode);
     }
   }
-
   if (b1 && btn1WasDown && (now - btn1DownAt) >= 3000){
     // long press: enter CAL
     ui = CAL_MENU;
     calItem = CALI_ADC_SCALE_UP;
-    btn1DownAt = now + 100000; // prevent repeats
+    btn1DownAt = now + 100000; 
   }
 
-  (void)b2; // BTN2 unused on RUN screen
+  // --- Button 2 (D3) Logic (NEW) ---
+  if (b2 && !btn2WasDown) btn2DownAt = now;
+  if (!b2 && btn2WasDown){
+    if ((now - btn2DownAt) < 1500){
+      // short press: toggle F/C
+      useFahrenheit = !useFahrenheit;
+      // Save to EEPROM (using your existing EE_TEMP_UNIT address)
+      EEPROM.update(EE_TEMP_UNIT, (uint8_t)(useFahrenheit ? 1 : 0));
+    }
+  }
+
   btn1WasDown = b1;
   btn2WasDown = b2;
 }
@@ -518,7 +527,10 @@ void setup(){
   pinMode(BTN2_PIN, INPUT_PULLUP);
   chargeOff();
 
-  analogReference(INTERNAL); // 1.1 V
+  // Change or remove this line:
+  // analogReference(INTERNAL); 
+  analogReference(DEFAULT); // Set global reference to 5V
+  
   delay(50);
 
   loadOrInitEEPROM();
